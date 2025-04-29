@@ -525,7 +525,7 @@ impl Proxy for UnixProxy {
         };
 
         if let Err(e) = shutdown(self.fd, how) {
-            warn!("error sending shutdown to socket: {}", e);
+            debug!("error sending shutdown to socket: {}", e);
         }
     }
 

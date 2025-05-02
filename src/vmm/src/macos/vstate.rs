@@ -138,7 +138,6 @@ impl Vm {
         guest_addr: u64,
         len: u64,
     ) {
-        debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
             error!("Error removing memory map: {:?}", e);
         }

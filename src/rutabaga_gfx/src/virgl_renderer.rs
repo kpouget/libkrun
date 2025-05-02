@@ -361,6 +361,7 @@ impl VirglRenderer {
         let mut map_ptr = 0;
         let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut map_ptr) };
         ret_to_res(ret)?;
+        warn!("map_ptr ==> {:x}", map_ptr);
 
         Ok(map_ptr)
     }
@@ -667,6 +668,7 @@ impl RutabagaComponent for VirglRenderer {
                 num_iovs: num_iovecs as u32,
             };
 
+            warn!("virgl_renderer_resource_create_blob?");
             let ret = unsafe { virgl_renderer_resource_create_blob(&resource_create_args) };
             ret_to_res(ret)?;
 

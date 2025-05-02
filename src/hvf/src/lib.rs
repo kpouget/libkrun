@@ -14,6 +14,8 @@ extern crate log;
 
 use bindings::*;
 
+use log::warn;
+use log::error;
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;
 
@@ -267,6 +269,9 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
+        warn!("map_memory: host_start_addr={:x}, guest_start_addr={:x}, size={}",
+              host_start_addr, guest_start_addr, size);
+
         let ret = unsafe {
             hv_vm_map(
                 host_start_addr as *mut core::ffi::c_void,
@@ -276,6 +281,7 @@ impl HvfVm {
             )
         };
         if ret != HV_SUCCESS {
+            error!("map_memory: err {}", ret);
             Err(Error::MemoryMap)
         } else {
             Ok(())

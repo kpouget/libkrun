@@ -5,7 +5,6 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{unbounded, Sender};
 use libc::c_void;
@@ -669,7 +668,8 @@ impl VirtioGpu {
                 }
 
                 let guest_addr = shm_region.guest_addr + offset;
-                debug!(
+
+                warn!(
                     "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
                     map_ptr, guest_addr, resource.size
                 );

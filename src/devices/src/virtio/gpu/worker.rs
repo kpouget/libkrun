@@ -274,12 +274,19 @@ impl Worker {
                             Ok(fence_id) => {
                                 fence_ids.push(fence_id);
                             }
-                            Err(_) => return Err(GpuResponse::ErrUnspec),
+                            Err(_) => {
+                                warn!("virtio_gpu.submit_command()? err :/");
+
+                                return Err(GpuResponse::ErrUnspec)
+                            }
                         }
                     }
 
                     if reader.read_exact(&mut cmd_buf[..]).is_ok() {
-                        virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids)
+                        let ret = virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids);
+
+                        warn!("virtio_gpu.submit_command --> done");
+                        ret
                     } else {
                         Err(GpuResponse::ErrInvalidParameter)
                     }

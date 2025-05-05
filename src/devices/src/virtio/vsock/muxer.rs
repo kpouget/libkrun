@@ -229,7 +229,7 @@ impl VsockMuxer {
                 self.proxy_map.write().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
-                warn!("deferring proxy removal: {}", id);
+                debug!("deferring proxy removal: {}", id);
                 if let Some(reaper_sender) = &self.reaper_sender {
                     if reaper_sender.send(id).is_err() {
                         self.proxy_map.write().unwrap().remove(&id);
@@ -488,7 +488,7 @@ impl VsockMuxer {
                 if pkt.op() == uapi::VSOCK_OP_RW {
                     self.process_dgram_rw(pkt);
                 } else {
-                    error!("unexpected dgram pkt: {}", pkt.op());
+                    debug!("unexpected dgram pkt: {}", pkt.op());
                 }
             }
         }

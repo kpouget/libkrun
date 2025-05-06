@@ -283,10 +283,7 @@ impl Worker {
                     }
 
                     if reader.read_exact(&mut cmd_buf[..]).is_ok() {
-                        let ret = virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids);
-
-                        warn!("virtio_gpu.submit_command --> done");
-                        ret
+                        virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids)
                     } else {
                         Err(GpuResponse::ErrInvalidParameter)
                     }

@@ -669,10 +669,10 @@ impl VirtioGpu {
 
                 let guest_addr = shm_region.guest_addr + offset;
 
-                warn!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
-                );
+                //warn!(
+                //    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
+                //    map_ptr, guest_addr, resource.size
+                //);
 
                 let (reply_sender, reply_receiver) = unbounded();
                 self.map_sender

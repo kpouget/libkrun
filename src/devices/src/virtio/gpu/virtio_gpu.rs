@@ -7,8 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{unbounded, Sender};
-#[cfg(target_os = "macos")]
-use hvf::MemoryMapping;
 use libc::c_void;
 #[cfg(target_os = "macos")]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
@@ -27,6 +25,8 @@ use rutabaga_gfx::{
     RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
 };
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
 
 use super::super::Queue as VirtQueue;
@@ -106,7 +106,7 @@ pub struct VirtioGpu {
     resources: BTreeMap<u32, VirtioGpuResource>,
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
-    map_sender: Sender<MemoryMapping>,
+    map_sender: Sender<WorkerMessage>,
 }
 
 impl VirtioGpu {
@@ -181,7 +181,7 @@ impl VirtioGpu {
         intc: Option<IrqChip>,
         irq_line: Option<u32>,
         virgl_flags: u32,
-        #[cfg(target_os = "macos")] map_sender: Sender<MemoryMapping>,
+        #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
     ) -> Self {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
@@ -676,7 +676,7 @@ impl VirtioGpu {
 
                 let (reply_sender, reply_receiver) = unbounded();
                 self.map_sender
-                    .send(MemoryMapping::AddMapping(
+                    .send(WorkerMessage::GpuAddMapping(
                         reply_sender,
                         map_ptr,
                         guest_addr,
@@ -756,7 +756,7 @@ impl VirtioGpu {
 
         let (reply_sender, reply_receiver) = unbounded();
         self.map_sender
-            .send(MemoryMapping::RemoveMapping(
+            .send(WorkerMessage::GpuRemoveMapping(
                 reply_sender,
                 guest_addr,
                 resource.size,

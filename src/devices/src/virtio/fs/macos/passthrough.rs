@@ -14,12 +14,12 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr::null_mut;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Sender};
-use hvf::MemoryMapping;
+use utils::worker_message::WorkerMessage;
 
 use crate::virtio::fs::filesystem::SecContext;
 
@@ -1238,7 +1238,15 @@ impl FileSystem for PassthroughFs {
         debug!("read: {:?}", inode);
         #[cfg(not(feature = "efi"))]
         if inode == self.init_inode {
-            return w.write(&INIT_BINARY[offset as usize..(offset + (size as u64)) as usize]);
+            let off: usize = offset
+                .try_into()
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            let len = if off + (size as usize) < INIT_BINARY.len() {
+                size as usize
+            } else {
+                INIT_BINARY.len() - off
+            };
+            return w.write(&INIT_BINARY[off..(off + len)]);
         }
 
         let data = self
@@ -1986,7 +1994,7 @@ impl FileSystem for PassthroughFs {
         moffset: u64,
         guest_shm_base: u64,
         shm_size: u64,
-        map_sender: &Option<Sender<MemoryMapping>>,
+        map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         if map_sender.is_none() {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
@@ -2035,7 +2043,7 @@ impl FileSystem for PassthroughFs {
         let sender = map_sender.as_ref().unwrap();
         let (reply_sender, reply_receiver) = unbounded();
         sender
-            .send(MemoryMapping::AddMapping(
+            .send(WorkerMessage::GpuAddMapping(
                 reply_sender,
                 host_addr as u64,
                 guest_addr,
@@ -2062,7 +2070,7 @@ impl FileSystem for PassthroughFs {
         requests: Vec<fuse::RemovemappingOne>,
         guest_shm_base: u64,
         shm_size: u64,
-        map_sender: &Option<Sender<MemoryMapping>>,
+        map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         if map_sender.is_none() {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
@@ -2085,7 +2093,7 @@ impl FileSystem for PassthroughFs {
             let sender = map_sender.as_ref().unwrap();
             let (reply_sender, reply_receiver) = unbounded();
             sender
-                .send(MemoryMapping::RemoveMapping(
+                .send(WorkerMessage::GpuRemoveMapping(
                     reply_sender,
                     guest_addr,
                     req.len,
@@ -2104,5 +2112,30 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+
+    fn ioctl(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _flags: u32,
+        cmd: u32,
+        arg: u64,
+        _in_size: u32,
+        _out_size: u32,
+        exit_code: &Arc<AtomicI32>,
+    ) -> io::Result<Vec<u8>> {
+        // We can't use nix::request_code_none here since it's system-dependent
+        // and we need the value from Linux.
+        const VIRTIO_IOC_EXIT_CODE_REQ: u32 = 0x7602;
+
+        match cmd {
+            VIRTIO_IOC_EXIT_CODE_REQ => {
+                exit_code.store(arg as i32, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        }
     }
 }

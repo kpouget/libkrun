@@ -5,10 +5,7 @@
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::unbounded;
-
-#[cfg(any(target_os = "macos", feature = "tee"))]
 use crossbeam_channel::Sender;
-
 use kernel::cmdline::Cmdline;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
@@ -18,6 +15,7 @@ use std::io::{self, Read};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use super::{Error, Vmm};
@@ -25,8 +23,6 @@ use super::{Error, Vmm};
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(feature = "tee")]
-use crate::linux::vstate::MemoryProperties;
 use crate::resources::VmResources;
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -44,8 +40,6 @@ use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(feature = "net")]
 use devices::virtio::Net;
 use devices::virtio::{port_io, MmioTransport, PortDescription, Vsock};
-#[cfg(target_os = "macos")]
-use hvf::MemoryMapping;
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -81,6 +75,7 @@ use linux_loader::loader::{self, KernelLoader};
 use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
+use utils::worker_message::WorkerMessage;
 #[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
 use vm_memory::mmap::MmapRegion;
 #[cfg(not(feature = "tee"))]
@@ -514,12 +509,7 @@ pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
-    #[cfg(target_os = "macos")] _map_sender: Sender<MemoryMapping>,
-    #[cfg(target_arch = "x86_64")] irq_sender: crossbeam_channel::Sender<(
-        devices::legacy::IrqWorkerMessage,
-        EventFd,
-    )>,
-    #[cfg(feature = "tee")] pm_sender: (Sender<MemoryProperties>, EventFd),
+    _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
 
@@ -674,7 +664,10 @@ pub fn build_microvm(
     #[cfg(target_arch = "x86_64")]
     {
         let ioapic: Box<dyn IrqChipT> = if vm_resources.split_irqchip {
-            Box::new(IoApic::new(vm.fd(), irq_sender).map_err(StartMicrovmError::CreateKvmIrqChip)?)
+            Box::new(
+                IoApic::new(vm.fd(), _sender.clone())
+                    .map_err(StartMicrovmError::CreateKvmIrqChip)?,
+            )
         } else {
             Box::new(KvmIoapic::new(vm.fd()).map_err(StartMicrovmError::CreateKvmIrqChip)?)
         };
@@ -696,7 +689,7 @@ pub fn build_microvm(
             &pio_device_manager.io_bus,
             &exit_evt,
             #[cfg(feature = "tee")]
-            pm_sender,
+            _sender,
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -763,6 +756,9 @@ pub fn build_microvm(
         )?;
     }
 
+    // We use this atomic to record the exit code set by init/init.c in the VM.
+    let exit_code = Arc::new(AtomicI32::new(i32::MAX));
+
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
@@ -770,6 +766,7 @@ pub fn build_microvm(
         vcpus_handles: Vec::new(),
         exit_evt,
         exit_observers: Vec::new(),
+        exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
@@ -805,9 +802,10 @@ pub fn build_microvm(
             intc.clone(),
             virgl_flags,
             #[cfg(target_os = "macos")]
-            _map_sender.clone(),
+            _sender.clone(),
         )?;
     }
+
     #[cfg(not(feature = "tee"))]
     attach_fs_devices(
         &mut vmm,
@@ -816,8 +814,9 @@ pub fn build_microvm(
         #[cfg(not(feature = "tee"))]
         export_table,
         intc.clone(),
+        exit_code,
         #[cfg(target_os = "macos")]
-        _map_sender,
+        _sender,
     )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
@@ -1457,7 +1456,7 @@ fn create_vcpus_x86_64(
     entry_addr: GuestAddress,
     io_bus: &devices::Bus,
     exit_evt: &EventFd,
-    #[cfg(feature = "tee")] pm_sender: (Sender<MemoryProperties>, EventFd),
+    #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -1469,7 +1468,7 @@ fn create_vcpus_x86_64(
             io_bus.clone(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
             #[cfg(feature = "tee")]
-            (pm_sender.0.clone(), pm_sender.1.try_clone().unwrap()),
+            pm_sender.clone(),
         )
         .map_err(Error::Vcpu)?;
 
@@ -1587,13 +1586,19 @@ fn attach_fs_devices(
     shm_manager: &mut ShmManager,
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
-    #[cfg(target_os = "macos")] map_sender: Sender<MemoryMapping>,
+    exit_code: Arc<AtomicI32>,
+    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     for (i, config) in fs_devs.iter().enumerate() {
         let fs = Arc::new(Mutex::new(
-            devices::virtio::Fs::new(config.fs_id.clone(), config.shared_dir.clone()).unwrap(),
+            devices::virtio::Fs::new(
+                config.fs_id.clone(),
+                config.shared_dir.clone(),
+                exit_code.clone(),
+            )
+            .unwrap(),
         ));
 
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
@@ -1863,7 +1868,7 @@ fn attach_gpu_device(
     #[cfg(not(feature = "tee"))] mut export_table: Option<ExportTable>,
     intc: IrqChip,
     virgl_flags: u32,
-    #[cfg(target_os = "macos")] map_sender: Sender<MemoryMapping>,
+    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 

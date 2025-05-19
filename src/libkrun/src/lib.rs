@@ -5,8 +5,6 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
-#[cfg(feature = "tee")]
-use std::ffi::c_void;
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -22,7 +20,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-#[cfg(any(target_os = "macos", feature = "tee"))]
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::ImageType;
@@ -31,8 +28,6 @@ use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
 use env_logger::Env;
-#[cfg(target_os = "macos")]
-use hvf::MemoryMapping;
 #[cfg(not(feature = "efi"))]
 use libc::size_t;
 use libc::{c_char, c_int};
@@ -55,17 +50,6 @@ use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
-
-#[cfg(feature = "tee")]
-use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
-
-#[cfg(feature = "tee")]
-use vm_memory::{guest_memory::GuestMemory, GuestAddress, GuestMemoryRegion, MemoryRegionAddress};
-
-#[cfg(feature = "tee")]
-use libc::{
-    fallocate, madvise, EFD_SEMAPHORE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, MADV_DONTNEED,
-};
 
 // Value returned on success. We use libc's errors otherwise.
 const KRUN_SUCCESS: i32 = 0;
@@ -1077,6 +1061,19 @@ pub unsafe extern "C" fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+pub unsafe extern "C" fn krun_check_nested_virt() -> i32 {
+    #[cfg(target_os = "macos")]
+    match hvf::check_nested_virt() {
+        Ok(supp) => supp as i32,
+        Err(_) => -libc::EINVAL,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    -libc::EOPNOTSUPP
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
 pub extern "C" fn krun_split_irqchip(ctx_id: u32, enable: bool) -> i32 {
     if enable && !cfg!(target_arch = "x86_64") {
         return -libc::EINVAL;
@@ -1160,7 +1157,7 @@ fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
             0_i64,
         )
     };
-    if kernel_host_addr == libc::MAP_FAILED {
+    if std::ptr::eq(kernel_host_addr, libc::MAP_FAILED) {
         error!("Can't load kernel into process map");
         return -libc::EINVAL;
     }
@@ -1494,32 +1491,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    let (sender, receiver) = unbounded();
-
-    #[cfg(target_arch = "x86_64")]
-    let (irq_sender, irq_receiver) = crossbeam_channel::unbounded();
-    #[cfg(feature = "tee")]
-    let (pm_sender, pm_receiver) = unbounded();
-    #[cfg(feature = "tee")]
-    let pm_efd =
-        EventFd::new(EFD_SEMAPHORE).expect("unable to create TEE memory properties eventfd");
+    let (sender, _receiver) = unbounded();
 
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
         ctx_cfg.shutdown_efd,
-        #[cfg(target_os = "macos")]
         sender,
-        #[cfg(target_arch = "x86_64")]
-        irq_sender,
-        #[cfg(feature = "tee")]
-        (
-            pm_sender,
-            pm_efd
-                .try_clone()
-                .expect("unable to clone TEE memory properties eventfd"),
-        ),
     ) {
         Ok(vmm) => vmm,
         Err(e) => {
@@ -1528,166 +1506,18 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
-    #[cfg(any(target_os = "macos", feature = "tee"))]
-    let mapper_vmm = _vmm.clone();
-
-    #[cfg(target_arch = "x86_64")]
-    let irq_vmm = _vmm.clone();
-
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
-        std::thread::Builder::new()
-            .name("mapping worker".into())
-            .spawn(move || loop {
-                match receiver.recv() {
-                    Err(e) => error!("Error in receiver: {:?}", e),
-                    Ok(m) => match m {
-                        MemoryMapping::AddMapping(s, h, g, l) => {
-                            mapper_vmm.lock().unwrap().add_mapping(s, h, g, l)
-                        }
-                        MemoryMapping::RemoveMapping(s, g, l) => {
-                            mapper_vmm.lock().unwrap().remove_mapping(s, g, l)
-                        }
-                    },
-                }
-            })
-            .unwrap();
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
     if ctx_cfg.vmr.split_irqchip {
-        std::thread::Builder::new()
-            .name("irq worker".into())
-            .spawn(move || loop {
-                match irq_receiver.recv() {
-                    Err(e) => error!("Error in receiver: {:?}", e),
-                    Ok((message, evt_fd)) => match message {
-                        devices::legacy::IrqWorkerMessage::GsiRoute(entries) => {
-                            let mut irq_routing = utils::sized_vec::vec_with_array_field::<
-                                kvm_bindings::kvm_irq_routing,
-                                kvm_bindings::kvm_irq_routing_entry,
-                            >(entries.len());
-                            irq_routing[0].nr = entries.len() as u32;
-                            irq_routing[0].flags = 0;
-
-                            unsafe {
-                                let entries_slice: &mut [kvm_bindings::kvm_irq_routing_entry] =
-                                    irq_routing[0].entries.as_mut_slice(entries.len());
-                                entries_slice.copy_from_slice(&entries);
-                            }
-
-                            irq_vmm
-                                .lock()
-                                .unwrap()
-                                .kvm_vm()
-                                .fd()
-                                .set_gsi_routing(&irq_routing[0])
-                                .unwrap();
-
-                            evt_fd.write(1).unwrap();
-                        }
-                        devices::legacy::IrqWorkerMessage::IrqLine(irq, active) => {
-                            irq_vmm
-                                .lock()
-                                .unwrap()
-                                .kvm_vm()
-                                .fd()
-                                .set_irq_line(irq, active)
-                                .unwrap();
-                            evt_fd.write(1).unwrap();
-                        }
-                    },
-                }
-            })
-            .unwrap();
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
     }
 
-    #[cfg(feature = "tee")]
-    let guest_mem = _vmm.lock().unwrap().guest_memory().clone();
-
-    #[cfg(feature = "tee")]
-    std::thread::Builder::new()
-        .name("TEE memory properties worker".into())
-        .spawn(move || loop {
-            match pm_receiver.recv() {
-                Err(e) => error!("Error in pm receiver: {:?}", e),
-                Ok(m) => {
-                    let (guest_memfd, region_start) = mapper_vmm
-                        .lock()
-                        .unwrap()
-                        .kvm_vm()
-                        .guest_memfd_get(m.gpa)
-                        .unwrap_or_else(|| panic!("unable to find KVM guest_memfd for memory region corresponding to GPA 0x{:x}", m.gpa));
-
-                    let attributes: u64 = if m.private {
-                        KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
-                    } else {
-                        0
-                    };
-
-                    let attr = kvm_memory_attributes {
-                        address: m.gpa,
-                        size: m.size,
-                        attributes,
-                        flags: 0,
-                    };
-
-                    mapper_vmm
-                        .lock()
-                        .unwrap()
-                        .kvm_vm()
-                        .fd()
-                        .set_memory_attributes(attr)
-                        .unwrap_or_else(|_| panic!("unable to set memory attributes for memory region corresponding to guest address 0x{:x}", m.gpa));
-
-                    let region = guest_mem.find_region(GuestAddress(m.gpa));
-                    if region.is_none() {
-                        error!("guest memory region corresponding to GPA 0x{:x} not found", m.gpa);
-                        pm_efd.write(1).unwrap();
-                        continue;
-                    }
-
-                    let offset = m.gpa - region_start;
-
-                    if m.private {
-                        let region_addr = MemoryRegionAddress(offset);
-
-                        let host_startaddr = region
-                            .unwrap()
-                            .get_host_address(region_addr)
-                            .expect("host address corresponding to memory region address 0x{:x} not found");
-
-                        let ret = unsafe {
-                            madvise(
-                                host_startaddr as *mut c_void,
-                                m.size.try_into().unwrap(),
-                                MADV_DONTNEED,
-                            )
-                        };
-
-                        if ret < 0 {
-                            error!("unable to advise kernel that memory region corresponding to GPA 0x{:x} will likely not be needed (madvise)", m.gpa);
-                        }
-                    } else {
-                        let ret = unsafe {
-                            fallocate(
-                                guest_memfd,
-                                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                                offset as i64,
-                                m.size as i64,
-                            )
-                        };
-
-                        if ret < 0 {
-                            error!("unable to allocate space in guest_memfd for shared memory (fallocate)");
-                        }
-                    }
-
-                    pm_efd.write(1).unwrap();
-                }
-            }
-        })
-        .unwrap();
+    #[cfg(feature = "amd-sev")]
+    vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
     loop {
         match event_manager.run() {

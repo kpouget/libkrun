@@ -5,7 +5,7 @@
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 #[cfg(target_os = "macos")]
-use hvf::MemoryMapping;
+use utils::worker_message::WorkerMessage;
 
 use std::collections::BTreeMap;
 use std::convert::TryInto;
@@ -13,6 +13,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::mem;
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1133,7 +1134,7 @@ pub trait FileSystem {
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<MemoryMapping>>,
+        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -1144,7 +1145,7 @@ pub trait FileSystem {
         requests: Vec<RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<MemoryMapping>>,
+        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -1160,6 +1161,7 @@ pub trait FileSystem {
         arg: u64,
         in_size: u32,
         out_size: u32,
+        exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }

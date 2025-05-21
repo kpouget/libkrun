@@ -269,9 +269,10 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
-        warn!("map_memory: host_start_addr={:x}, guest_start_addr={:x}, size={}",
-              host_start_addr, guest_start_addr, size);
-
+        if guest_start_addr == 0 || guest_start_addr == 0x40000000 || guest_start_addr == 0x300000000 {
+          warn!("map_memory: host_start_addr={:x}, guest_start_addr={:x}, size={}",
+                host_start_addr, guest_start_addr, size);
+        }
         let ret = unsafe {
             hv_vm_map(
                 host_start_addr as *mut core::ffi::c_void,
